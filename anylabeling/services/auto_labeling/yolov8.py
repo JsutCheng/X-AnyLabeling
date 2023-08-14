@@ -6,6 +6,7 @@ import numpy as np
 import onnxruntime as ort
 from PyQt5 import QtCore
 from PyQt5.QtCore import QCoreApplication
+from ultralytics import YOLO
 
 from anylabeling.app_info import __preferred_device__
 from anylabeling.views.labeling.shape import Shape
@@ -55,108 +56,143 @@ class YOLOv8(Model):
         if __preferred_device__ == "GPU":
             self.providers = ['CUDAExecutionProvider']
 
-        self.net = ort.InferenceSession(
-                        model_abs_path, 
-                        providers=self.providers,
-                        sess_options=self.sess_opts,
-                    )
+        # 如果onnx模型路径中存在pt模型，优先使用pt模型
+        pt_modle_abs_path = model_abs_path.replace('onnx', 'pt')
+        if os.path.exists(pt_modle_abs_path):
+            self.model_abs_path = pt_modle_abs_path
+        else:
+            self.model_abs_path = model_abs_path
+            
+        if self.model_abs_path.endswith("onnx"):
+            self.net = ort.InferenceSession(
+                            model_abs_path, 
+                            providers=self.providers,
+                            sess_options=self.sess_opts,
+                        )
+        if self.model_abs_path.endswith("pt"):
+            self.net = YOLO(self.model_abs_path) 
         self.classes = self.config["classes"]
 
     def pre_process(self, input_image, net):
         """
         Pre-process the input image before feeding it to the network.
         """
-        # Resized
-        input_img = cv2.resize(input_image, (640, 640))
+        if self.model_abs_path.endswith("onnx"):
+            # Resized
+            input_img = cv2.resize(input_image, (640, 640))
 
-        # Norm
-        input_img = input_img / 255.0
+            # Norm
+            input_img = input_img / 255.0
 
-        # Transposed
-        input_img = input_img.transpose(2, 0, 1)
-        
-        # Processed
-        blob = input_img[np.newaxis, :, :, :].astype(np.float32)
+            # Transposed
+            input_img = input_img.transpose(2, 0, 1)
+            
+            # Processed
+            blob = input_img[np.newaxis, :, :, :].astype(np.float32)
 
-        inputs = net.get_inputs()[0].name
-        outputs = net.run(None, {inputs: blob})[0]
-        outputs = np.transpose(outputs, (0, 2, 1))
-
-        return outputs
+            inputs = net.get_inputs()[0].name
+            outputs = net.run(None, {inputs: blob})[0]
+            outputs = np.transpose(outputs, (0, 2, 1))
+            return outputs
+    
+        if self.model_abs_path.endswith("pt"):
+            results = self.net(input_image)
+            return results[0]
 
     def post_process(self, input_image, outputs):
         """
         Post-process the network's output, to get the bounding boxes and
         their confidence scores.
         """
-        # Lists to hold respective values while unwrapping.
-        class_ids = []
-        confidences = []
-        boxes = []
+        if self.model_abs_path.endswith("onnx"):
+            # Lists to hold respective values while unwrapping.
+            class_ids = []
+            confidences = []
+            boxes = []
 
-        # Rows.
-        rows = outputs.shape[1]
+            # Rows.
+            rows = outputs.shape[1]
 
-        image_height, image_width = input_image.shape[:2]
+            image_height, image_width = input_image.shape[:2]
 
-        # Resizing factor.
-        x_factor = image_width / self.config["input_width"]
-        y_factor = image_height / self.config["input_height"]
+            # Resizing factor.
+            x_factor = image_width / self.config["input_width"]
+            y_factor = image_height / self.config["input_height"]
 
-        # Iterate through 8400 rows.
-        for r in range(rows):
-            row = outputs[0][r]
-            classes_scores = row[4:]
+            # Iterate through 8400 rows.
+            for r in range(rows):
+                row = outputs[0][r]
+                classes_scores = row[4:]
 
-            # Get the index of max class score and confidence.
-            _, confidence, _, (_, class_id) = cv2.minMaxLoc(classes_scores)
+                # Get the index of max class score and confidence.
+                _, confidence, _, (_, class_id) = cv2.minMaxLoc(classes_scores)
 
-            # Discard confidence lower than threshold
-            if confidence >= self.config["confidence_threshold"]:
-                confidences.append(confidence)
-                class_ids.append(class_id)
+                # Discard confidence lower than threshold
+                if confidence >= self.config["confidence_threshold"]:
+                    confidences.append(confidence)
+                    class_ids.append(class_id)
 
-                cx, cy, w, h = row[0], row[1], row[2], row[3]
+                    cx, cy, w, h = row[0], row[1], row[2], row[3]
 
-                left = int((cx - w / 2) * x_factor)
-                top = int((cy - h / 2) * y_factor)
-                width = int(w * x_factor)
-                height = int(h * y_factor)
+                    left = int((cx - w / 2) * x_factor)
+                    top = int((cy - h / 2) * y_factor)
+                    width = int(w * x_factor)
+                    height = int(h * y_factor)
 
-                box = np.array([left, top, width, height])
-                boxes.append(box)
+                    box = np.array([left, top, width, height])
+                    boxes.append(box)
 
-        # Perform non maximum suppression to eliminate redundant
-        # overlapping boxes with lower confidences.
-        indices = cv2.dnn.NMSBoxes(
-            boxes,
-            confidences,
-            self.config["confidence_threshold"],
-            self.config["nms_threshold"],
-        )
+            # Perform non maximum suppression to eliminate redundant
+            # overlapping boxes with lower confidences.
+            indices = cv2.dnn.NMSBoxes(
+                boxes,
+                confidences,
+                self.config["confidence_threshold"],
+                self.config["nms_threshold"],
+            )
 
-        output_boxes = []
-        for i in indices:
-            box = boxes[i]
-            left = box[0]
-            top = box[1]
-            width = box[2]
-            height = box[3]
-            label = self.classes[class_ids[i]]
-            score = confidences[i]
+            output_boxes = []
+            for i in indices:
+                box = boxes[i]
+                left = box[0]
+                top = box[1]
+                width = box[2]
+                height = box[3]
+                label = self.classes[class_ids[i]]
+                score = confidences[i]
 
-            output_box = {
-                "x1": left,
-                "y1": top,
-                "x2": left + width,
-                "y2": top + height,
-                "label": label,
-                "score": score,
-            }
+                output_box = {
+                    "x1": left,
+                    "y1": top,
+                    "x2": left + width,
+                    "y2": top + height,
+                    "label": label,
+                    "score": score,
+                }
+                output_boxes.append(output_box)
 
-            output_boxes.append(output_box)
-
-        return output_boxes
+            return output_boxes
+        
+        if self.model_abs_path.endswith("pt"):
+            self.classes = []
+            for k,v in outputs.names.items():
+                self.classes.append(v)
+            outputs = outputs.boxes
+            output_boxes = []
+            cls = outputs.cls
+            scores = outputs.conf
+            boxes = outputs.xyxy
+            for idx in range(boxes.shape[0]):
+                output_box = {
+                    "x1": boxes[idx][0],
+                    "y1": boxes[idx][1],
+                    "x2": boxes[idx][2],
+                    "y2": boxes[idx][3],
+                    "label": self.classes[int(cls[idx])],
+                    "score": scores[idx],
+                }
+                output_boxes.append(output_box)
+            return output_boxes
 
     def predict_shapes(self, image, image_path=None):
         """
